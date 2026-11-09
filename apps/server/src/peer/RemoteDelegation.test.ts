@@ -92,6 +92,7 @@ interface BoxThread {
   readonly delegatedFrom: Ref.Ref<ThreadLaunch.ThreadLaunchInput["delegatedFrom"] | null>;
   /** The model and modes it was launched with. */
   readonly launchedWith: Ref.Ref<LaunchedWith | null>;
+  readonly workspaceStrategy: Ref.Ref<ThreadLaunch.ThreadLaunchInput["workspaceStrategy"] | null>;
   /** The first message the thread there was launched with. */
   readonly message: Ref.Ref<string | null>;
   readonly status: Ref.Ref<OrchestrationV2Run["status"]>;
@@ -141,6 +142,9 @@ const makeBoxThread = Effect.gen(function* () {
     ),
     delegatedFrom: yield* Ref.make<ThreadLaunch.ThreadLaunchInput["delegatedFrom"] | null>(null),
     launchedWith: yield* Ref.make<LaunchedWith | null>(null),
+    workspaceStrategy: yield* Ref.make<ThreadLaunch.ThreadLaunchInput["workspaceStrategy"] | null>(
+      null,
+    ),
     message: yield* Ref.make<string | null>(null),
     status: yield* Ref.make<OrchestrationV2Run["status"]>("running"),
     reply: yield* Ref.make<string | null>("Working…"),
@@ -431,6 +435,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
       ),
   });
   const layerBoxLaunches = Layer.mock(ThreadLaunch.ThreadLaunchService)({
+    checkWorktreeBase: () => Effect.void,
     launch: (input) =>
       Ref.get(thread.runless).pipe(
         Effect.flatMap((runless) =>
@@ -438,6 +443,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
             Effect.andThen(Ref.set(thread.linkOrigin, input.linkOrigin ?? null)),
             Effect.andThen(Ref.set(thread.delegatedFrom, input.delegatedFrom ?? null)),
             Effect.andThen(Ref.set(thread.message, input.initialMessage?.text ?? null)),
+            Effect.andThen(Ref.set(thread.workspaceStrategy, input.workspaceStrategy)),
             Effect.andThen(
               Ref.set(thread.launchedWith, {
                 modelSelection: input.modelSelection,
@@ -1126,29 +1132,45 @@ it.effect("a task named only by environment inherits the parent's model, within 
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("refuses worktree isolation for a task there before launching anything", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const thread = yield* makeBoxThread;
-      const b = yield* serveBox(thread);
-      const offers = yield* SubscriptionRef.make<
-        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
-      >([]);
-      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
-      const a = yield* makeLaptop(database, offers);
-      yield* linkTo(a.links, b, "auto");
-      yield* seedParent(a);
+it.effect(
+  "launches remote worktree isolation from the target checkout and records completion",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+        const a = yield* makeLaptop(database, offers);
+        yield* linkTo(a.links, b, "auto");
+        yield* seedParent(a);
 
-      const result = yield* a.call("delegate_task", {
-        task: "Run the suite on the box.",
-        target: { environmentId: box.environmentId },
-        isolation: "worktree",
-      });
-      expect(result.isError).toBe(true);
-      expect(JSON.stringify(result.content)).toContain("isolation");
-      expect(yield* Ref.get(thread.launched)).toBeNull();
-    }),
-  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+        const result = yield* a.call("delegate_task", {
+          task: "Run the suite on the box.",
+          target: { environmentId: box.environmentId },
+          isolation: "worktree",
+        });
+        expect(result.isError, JSON.stringify(result.content)).toBe(false);
+        expect(yield* Ref.get(thread.workspaceStrategy)).toEqual({
+          type: "worktree",
+          baseRef: "HEAD",
+          startFromOrigin: false,
+        });
+        const delegated = result.structuredContent as { taskId: NodeId };
+        expect((yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents).toHaveLength(
+          1,
+        );
+        yield* Ref.set(thread.reply, "Worktree checks passed.");
+        yield* Ref.set(thread.status, "completed");
+        yield* Deferred.succeed(thread.finished, undefined);
+        expect(yield* taskResult(a, delegated.taskId)).toMatchObject({
+          status: "completed",
+          result: "Worktree checks passed.",
+        });
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
 it.effect("follows an open task again after the laptop restarts", () =>

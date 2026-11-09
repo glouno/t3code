@@ -212,15 +212,6 @@ const make = Effect.gen(function* () {
       }
       const parentNodeId = parentRun.rootNodeId;
       const { target } = input;
-      // A worktree there would branch from a commit this checkout has and the
-      // other may not, so a remote task runs in that project's checkout.
-      if (input.isolation === "worktree") {
-        return yield* new OrchestratorMcpFailure({
-          code: "invalid_request",
-          message:
-            'A task in a linked environment runs in that project\'s checkout; isolation "worktree" is not supported there. Omit isolation, or use t3_thread_launch with environmentId and a worktree workspaceStrategy.',
-        });
-      }
       // The provider and model inherit as they do for a task here. Another
       // provider there has no model to inherit, so the caller names one.
       const inherited = parent.thread.modelSelection;
@@ -268,6 +259,16 @@ const make = Effect.gen(function* () {
         {
           projectId,
           title,
+          // The parent's commit may not exist there; HEAD resolves in the target project.
+          ...(input.isolation === "worktree"
+            ? {
+                workspaceStrategy: {
+                  type: "worktree",
+                  baseRef: "HEAD",
+                  startFromOrigin: false,
+                } as const,
+              }
+            : {}),
           modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
           ...(runtimeMode === undefined ? {} : { runtimeMode }),
           ...(interactionMode === undefined ? {} : { interactionMode }),
