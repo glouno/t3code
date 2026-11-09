@@ -1154,6 +1154,127 @@ it.effect.each(["stable", "upstream/release"])(
     ),
 );
 
+it.effect.each([true, false])(
+  "pins a fetched parent commit despite branch advancement: %s, without checkout fallback",
+  (committed) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const git = yield* GitVcsDriver.GitVcsDriver;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "launch-target-head-" });
+      let cwd = `${directory}/repo`;
+      const worktreePath = `${directory}/worktree`;
+      yield* fs.makeDirectory(cwd);
+      const command = (at: string, args: string[]) =>
+        git.execute({ operation: "launch-test", cwd: at, args });
+      yield* command(cwd, ["init", "-b", "main"]);
+      yield* command(cwd, ["config", "user.name", "Test"]);
+      yield* command(cwd, ["config", "user.email", "test@example.test"]);
+      yield* fs.writeFileString(`${cwd}/source.txt`, "committed\n");
+      yield* command(cwd, ["add", "source.txt"]);
+      if (committed) yield* command(cwd, ["commit", "-m", "target commit"]);
+      const targetHead = committed
+        ? (yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim()
+        : null;
+      if (committed) {
+        const owner = cwd;
+        const remote = `${directory}/remote.git`;
+        yield* command(owner, ["init", "--bare", remote]);
+        yield* command(owner, ["remote", "add", "origin", remote]);
+        yield* command(owner, ["push", "-u", "origin", "main"]);
+        const destination = `${directory}/destination`;
+        yield* command(owner, ["clone", "--branch", "main", remote, destination]);
+        yield* fs.writeFileString(`${owner}/source.txt`, "newer branch revision\n");
+        yield* command(owner, ["add", "source.txt"]);
+        yield* command(owner, ["commit", "-m", "branch advances after handoff"]);
+        yield* command(owner, ["push", "origin", "main"]);
+        cwd = destination;
+        yield* command(cwd, ["fetch", "origin", "main"]);
+        yield* command(cwd, ["checkout", "-B", "main", "origin/main"]);
+        assert.notEqual((yield* command(cwd, ["rev-parse", "HEAD"])).stdout.trim(), targetHead);
+      }
+      yield* fs.writeFileString(`${cwd}/source.txt`, "dirty target\n");
+      yield* fs.writeFileString(`${cwd}/untracked.txt`, "keep me\n");
+      const setupStarted = yield* Deferred.make<void>();
+      const releaseSetup = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        hasCommit: ({ refName }) =>
+          command(cwd, ["rev-parse", "--verify", `${refName}^{commit}`]).pipe(
+            Effect.as(true),
+            Effect.orElseSucceed(() => false),
+          ),
+        git: { hasRefNamed: () => Effect.succeed(false) },
+        createWorktree: (input, options) =>
+          git.createWorktree({ ...input, cwd, path: worktreePath }, options),
+        runSetup: () =>
+          Deferred.succeed(setupStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseSetup)),
+            Effect.as({ status: "no-script" as const }),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const input = launchInput({
+          command: "command:launch:target-head",
+          thread: "thread:launch:target-head",
+          message: "Work in the isolated checkout.",
+          workspace: {
+            type: "worktree",
+            baseRef: targetHead ?? "1111111111111111111111111111111111111111",
+            branch: "feature",
+            startFromOrigin: false,
+          },
+        });
+        yield* launches.checkWorktreeBase({
+          projectId,
+          workspaceStrategy: input.workspaceStrategy,
+        });
+        const launched = yield* launches.launch(input);
+        if (!committed) {
+          yield* threads.streamStoredEventsFrom({ threadId: launched.threadId }).pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "run.updated" && stored.event.payload.status === "failed",
+            ),
+            Stream.runHead,
+          );
+          const failed = yield* threads.getThreadProjection(launched.threadId);
+          assert.equal(failed.runs[0]?.status, "failed");
+          assert.equal(failed.thread.worktreePath, null);
+          assert.equal(harness.runSetup.mock.calls.length, 0);
+          assert.equal(yield* fs.exists(worktreePath), false);
+          assert.equal(yield* fs.readFileString(`${cwd}/source.txt`), "dirty target\n");
+          assert.equal(yield* fs.readFileString(`${cwd}/untracked.txt`), "keep me\n");
+          return;
+        }
+        yield* Deferred.await(setupStarted);
+        const projection = yield* threads.getThreadProjection(launched.threadId);
+        assert.equal(projection.thread.worktreePath, worktreePath);
+        assert.equal(projection.thread.branch, "feature");
+        assert.equal(projection.runs[0]?.status, "preparing");
+        assert.equal(
+          (yield* command(worktreePath, ["rev-parse", "HEAD"])).stdout.trim(),
+          targetHead,
+        );
+        assert.equal(yield* fs.readFileString(`${worktreePath}/source.txt`), "committed\n");
+        assert.equal(yield* fs.exists(`${worktreePath}/untracked.txt`), false);
+        assert.equal(yield* fs.readFileString(`${cwd}/source.txt`), "dirty target\n");
+        assert.equal(yield* fs.readFileString(`${cwd}/untracked.txt`), "keep me\n");
+        const repeated = yield* launches.launch(input);
+        assert.equal(repeated.threadId, launched.threadId);
+        assert.equal(harness.createWorktree.mock.calls.length, 1);
+        yield* Deferred.succeed(releaseSetup, undefined);
+      }).pipe(Effect.provide(harness.layer));
+    }).pipe(
+      Effect.provide(
+        GitVcsDriver.layer.pipe(
+          Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "launch-target-git-" })),
+          Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+        ),
+      ),
+    ),
+);
+
 it.effect("fetches the origin base from the remote it already resolved", () => {
   let fetchInput: Deferred.Deferred<unknown> | null = null;
   const harness = makeHarness({
